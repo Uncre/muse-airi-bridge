@@ -1,4 +1,8 @@
-"""Versioned, bit-exact wire metadata; unrelated invisible text is never normalized."""
+"""Invisible wire header and emotion footer codec (`invisible-v1`).
+
+Encodes ASCII metadata bit-by-bit (MSB first) using U+200B (0) and U+200C (1).
+Invisible characters inside the message body or quotes are never modified.
+"""
 
 from __future__ import annotations
 
@@ -24,12 +28,14 @@ EMOTION_CODES = {
 
 
 def encode_bytes(data: bytes) -> str:
+    """Encode bytes MSB-first as a string of U+200B (0) and U+200C (1) characters."""
     return "".join(ONE if byte & (1 << bit) else ZERO for byte in data for bit in range(7, -1, -1))
 
 
 def decode_bytes(text: str) -> bytes:
+    """Decode a U+200B / U+200C bit string back into bytes."""
     if len(text) % 8 or any(char not in {ZERO, ONE} for char in text):
-        raise ValueError("Expected whole bytes encoded with U+200B and U+200C only.")
+        raise ValueError("Expected whole bytes encoded exclusively with U+200B and U+200C.")
     return bytes(
         int("".join("1" if char == ONE else "0" for char in text[i : i + 8]), 2)
         for i in range(0, len(text), 8)
@@ -42,6 +48,7 @@ FOOTER_LENGTH = 40
 
 
 def outbound_text(original: str, protocol: str = INVISIBLE_PROTOCOL) -> str:
+    """Prepend the 40-character invisible header for invisible-v1 turns."""
     if protocol == INVISIBLE_PROTOCOL:
         return INPUT_HEADER + original
     if protocol == LEGACY_PROTOCOL:
@@ -50,22 +57,26 @@ def outbound_text(original: str, protocol: str = INVISIBLE_PROTOCOL) -> str:
 
 
 def emotion_footer(emotion: str) -> str:
+    """Build the 40-character invisible emotion footer for a given AIRI emotion name."""
     code = next((code for code, name in EMOTION_CODES.items() if name == emotion), None)
     if code is None:
-        raise ValueError("Unsupported emotion.")
+        raise ValueError("Unsupported emotion name.")
     return encode_bytes(b"AE1:" + code.encode("ascii"))
 
 
 @dataclass(frozen=True)
 class DecodedReply:
+    """Result of parsing and stripping an optional invisible emotion footer."""
+
     text: str
     emotion: str
     status: Literal["valid", "missing", "invalid", "duplicate", "legacy"]
 
 
 def parse_reply(text: str, protocol: str = INVISIBLE_PROTOCOL) -> DecodedReply:
+    """Parse and strip the trailing 40-character AE1:<CODE> footer if present."""
     if protocol == LEGACY_PROTOCOL:
-        # Old cached replies never opted into this protocol, even if they quote its footer.
+        # Legacy cached replies from 0.1.0 never used the invisible footer protocol.
         return DecodedReply(text, "neutral", "legacy")
     if protocol != INVISIBLE_PROTOCOL:
         raise ValueError("Unsupported wire protocol.")

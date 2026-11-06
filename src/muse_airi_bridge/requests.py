@@ -1,7 +1,8 @@
-"""Recognize AIRI v0.14.1's rendered requests; never forward a whole prompt.
+"""Validate AIRI v0.14.1 Chat Completions requests and extract raw user text.
 
-Source fixtures are based on AIRI commit 349ecfeda2d0e1508a6b2c2a25740757c9ed51c6.
-This is intentionally a narrow Chat Completions subset, not a stateless LLM.
+Based on AIRI v0.14.1 (commit 349ecfeda2d0e1508a6b2c2a25740757c9ed51c6).
+This module implements an AIRI-specific subset rather than a generic stateless LLM API:
+it strips AIRI's envelope around the latest user message and rejects auxiliary calls.
 """
 
 from __future__ import annotations
@@ -54,6 +55,8 @@ class ChatRequest(BaseModel):
 
 @dataclass(frozen=True)
 class RoutedInput:
+    """Classified request ready for either a local probe reply or a Muse turn."""
+
     kind: Literal["probe", "conversation"]
     text: str = ""
     fingerprint: str = ""
@@ -64,17 +67,19 @@ def unsupported(message: str) -> BridgeError:
 
 
 def text_content(message: Message) -> str:
+    """Extract plain text from a string content field or an array of text parts."""
     if isinstance(message.content, str):
         return message.content
     if isinstance(message.content, list) and all(
         part.get("type") == "text" and isinstance(part.get("text"), str) for part in message.content
     ):
-        # AIRI's renderer concatenates text segments without a separator.
+        # AIRI concatenates text parts directly without inserting extra separators.
         return "".join(part["text"] for part in message.content)
-    raise unsupported("Only text content is supported for the current input.")
+    raise unsupported("Only plain text content is supported.")
 
 
 def extract_original(rendered: str) -> str:
+    """Strip AIRI's timestamp, reply header, skill prompt, and [Context] suffix."""
     match = DATE_PREFIX.match(rendered)
     if not match:
         raise unsupported("Unrecognized AIRI input envelope; expected the v0.14.1 datetime prefix.")
@@ -84,29 +89,30 @@ def extract_original(rendered: str) -> str:
         raise unsupported("Invalid AIRI datetime prefix.") from None
     original = rendered[match.end() :]
     if original.startswith("[Notice from "):
-        raise unsupported("AIRI notices are not owner messages and are not forwarded to Muse.")
+        raise unsupported("AIRI module notices are not owner messages and are not sent to Muse.")
     if original.startswith(("[Replying to:", "[Replying to message:")):
         reply = REPLY_PREFIX.match(original)
         if not reply:
-            raise unsupported("Unrecognized AIRI reply reference.")
+            raise unsupported("Unrecognized AIRI reply reference header.")
         original = original[reply.end() :]
     cuts = [original.find(marker) for marker in APPENDED_SECTIONS if marker in original]
     if cuts:
         original = original[: min(cuts)]
     if not original.strip():
-        raise unsupported("The original user input is empty.")
+        raise unsupported("The extracted user input is empty.")
     return original
 
 
 def route(request: ChatRequest) -> RoutedInput:
+    """Classify an incoming Chat Completions request as a local probe or conversation turn."""
     if request.model != MODEL:
         raise BridgeError(404, "model_not_found", f"Select model '{MODEL}'.")
     if request.n != 1 or request.stop not in (None, [], ""):
         raise unsupported("Only n=1 without stop sequences is supported.")
     if request.tool_choice not in (None, "auto", "none"):
-        raise unsupported("AIRI function tools cannot be required or selected by this bridge.")
+        raise unsupported("Required or forced function tool calls are not supported.")
     if request.response_format and request.response_format != {"type": "text"}:
-        raise unsupported("Structured output and auxiliary analysis are not supported.")
+        raise unsupported("Structured output formats and auxiliary analysis are not supported.")
     if request.model_extra and any(
         request.model_extra.get(name)
         for name in ("functions", "function_call", "modalities", "audio")
@@ -122,18 +128,19 @@ def route(request: ChatRequest) -> RoutedInput:
     ):
         return RoutedInput("probe")
     if request.messages[-1].role != "user":
-        raise unsupported("Only a new user turn is forwarded; continuations are not replayed.")
+        raise unsupported("Only a new user message is forwarded; tool continuations are rejected.")
     system_texts = [
         text_content(message)
         for message in request.messages
         if message.role in {"system", "developer"}
     ]
     if any(marker in text for text in system_texts for marker in AUXILIARY_SYSTEM_MARKERS):
-        raise unsupported("This AIRI background or auxiliary request is not forwarded to Muse.")
+        raise unsupported("AIRI background or auxiliary requests are not forwarded to Muse.")
     if system_texts and not any(text.startswith(CHAT_FORMAT_PREFIX) for text in system_texts):
-        raise unsupported("Unrecognized AIRI system envelope; no message was sent to Muse.")
+        raise unsupported("Unrecognized AIRI system prompt; no message was sent to Muse.")
     original = extract_original(text_content(request.messages[-1]))
-    # Include the entire (unforwarded) transcript to distinguish repeated words in later turns.
+    # Hash the full message history (even though only the latest user text is sent to Muse)
+    # so repeating the same word in a later conversation turn gets a distinct request key.
     canonical = json.dumps(
         {"model": request.model, "messages": [m.model_dump(mode="json") for m in request.messages]},
         ensure_ascii=False,

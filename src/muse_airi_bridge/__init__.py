@@ -1,3 +1,6 @@
-"""AIRI to Muse bridge. Importing the package performs no network or filesystem writes."""
+"""Local OpenAI-compatible bridge connecting AIRI to an existing Muse agent.
+
+Importing this package performs no network requests or filesystem writes.
+"""
 
 __version__ = "0.2.0"

@@ -1,3 +1,5 @@
+"""FastAPI application providing the AIRI-compatible Chat Completions subset."""
+
 from __future__ import annotations
 
 import asyncio
@@ -21,6 +23,7 @@ from .worker import BridgeWorker
 
 
 def completion(content: str, response_id: str, created: int) -> dict:
+    """Build a non-streaming OpenAI Chat Completions response object."""
     return {
         "id": response_id,
         "object": "chat.completion",
@@ -37,6 +40,7 @@ def completion(content: str, response_id: str, created: int) -> dict:
 
 
 def sse_chunks(content: str, response_id: str, created: int):
+    """Yield a completed reply as standard Chat Completions SSE chunks."""
     base = {
         "id": response_id,
         "object": "chat.completion.chunk",
@@ -54,6 +58,7 @@ def sse_chunks(content: str, response_id: str, created: int):
 
 
 def create_app(settings: Settings | None = None, *, adapter=None) -> FastAPI:
+    """Create the local bridge HTTP server application."""
     settings = settings or Settings.from_env()
     if len(settings.api_key) < 16 or settings.api_key.startswith("replace-with-"):
         raise ValueError("Set MUSE_BRIDGE_API_KEY to a random local key of at least 16 characters.")
@@ -82,7 +87,9 @@ def create_app(settings: Settings | None = None, *, adapter=None) -> FastAPI:
         if scheme.lower() != "bearer" or not hmac.compare_digest(
             token.encode("utf-8"), settings.api_key.encode("utf-8")
         ):
-            raise BridgeError(401, "invalid_api_key", "A valid local bridge API key is required.")
+            raise BridgeError(
+                401, "invalid_api_key", "A valid local bridge Bearer API key is required."
+            )
 
     @app.exception_handler(BridgeError)
     async def bridge_error(_request: Request, error: BridgeError):
@@ -112,7 +119,7 @@ def create_app(settings: Settings | None = None, *, adapter=None) -> FastAPI:
         async for chunk in request.stream():
             body.extend(chunk)
             if len(body) > settings.max_body_bytes:
-                raise BridgeError(413, "request_too_large", "The request body is too large.")
+                raise BridgeError(413, "request_too_large", "The request body exceeds the limit.")
         try:
             chat = ChatRequest.model_validate_json(bytes(body))
         except ValidationError:
@@ -127,7 +134,8 @@ def create_app(settings: Settings | None = None, *, adapter=None) -> FastAPI:
             )
         job_future = request.app.state.worker.submit(routed)
         future = asyncio.wrap_future(job_future)
-        # Consume safe exceptions even when a disconnected HTTP handler no longer awaits this job.
+        # Retrieve any exception on completion so asyncio does not log an unhandled future error
+        # when the HTTP client disconnects before the worker finishes.
         future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
         while not future.done():
             await asyncio.wait({future}, timeout=0.1)
@@ -140,8 +148,8 @@ def create_app(settings: Settings | None = None, *, adapter=None) -> FastAPI:
         headers = {"X-Muse-Bridge-Response": "muse", "X-Muse-Bridge-Job": job.job_id}
         if not chat.stream:
             return JSONResponse(completion(content, response_id, created), headers=headers)
-        # Buffer until completion so failures retain their real HTTP status and never look
-        # like successful empty speech. This is SSE transport, not live token generation.
+        # Wait for the full reply before starting the SSE response so that upstream errors or
+        # timeouts return their actual HTTP status code instead of an empty 200 stream.
         return StreamingResponse(
             sse_chunks(content, response_id, created),
             media_type="text/event-stream",

@@ -1,4 +1,7 @@
-"""All muse-cli internals are confined to this adapter. No upstream config writes."""
+"""Read-only adapter around muse-cli's Gateway and local authentication files.
+
+All direct dependencies on muse-cli internals are isolated in this module.
+"""
 
 from __future__ import annotations
 
@@ -14,21 +17,26 @@ from .protocol import INVISIBLE_PROTOCOL, LEGACY_PROTOCOL
 
 
 def text_hash(text: str) -> str:
+    """Return the SHA-256 hex digest of a UTF-8 string."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def payload(event: dict) -> dict:
+    """Extract the payload dictionary from a Muse chat event."""
     value = event.get("payload")
     return value if isinstance(value, dict) else {}
 
 
 def event_text(event: dict, protocol: str = LEGACY_PROTOCOL) -> str:
+    """Extract the canonical message text from a Muse event for the given protocol."""
     p = payload(event)
     if protocol == INVISIBLE_PROTOCOL:
         value = p.get("content")
         if not isinstance(value, str):
             raise BridgeError(
-                502, "muse_content_missing", "Muse payload.content is required for invisible-v1."
+                502,
+                "muse_content_missing",
+                "Muse event payload.content is required for invisible-v1.",
             )
         return value
     if protocol != LEGACY_PROTOCOL:
@@ -38,6 +46,7 @@ def event_text(event: dict, protocol: str = LEGACY_PROTOCOL) -> str:
 
 
 def eligible_reply(event: dict, baseline: int, protocol: str = LEGACY_PROTOCOL) -> bool:
+    """Return True if the event is a completed main-chat assistant reply after baseline."""
     p = payload(event)
     return (
         event.get("event_name") == "message.assistant"
@@ -54,6 +63,8 @@ class Session(Protocol):
 
 
 class MuseSession:
+    """Active Muse Gateway session for reading history and posting user turns."""
+
     def __init__(self, gateway, node_id: str):
         self.gateway = gateway
         self.node_id = node_id
@@ -70,8 +81,9 @@ class MuseSession:
         return sorted(events, key=lambda e: e["seq"])
 
     def send(self, text: str) -> None:
-        # Unlike _open alone, request also consumes the send echo and checks HTTP status.
-        # muse-cli PROTOCOL.md documents that this stream ends after that echo.
+        # gateway.request() waits for the send echo and checks the HTTP status.
+        # Per muse-cli's PROTOCOL.md, chat.stream closes after the send echo, while actual
+        # assistant completion is observed through chat.history.
         self.gateway.request(
             "chat.stream",
             body={
@@ -84,6 +96,8 @@ class MuseSession:
 
 
 class MuseAdapter:
+    """Open short-lived Gateway sessions using existing muse-cli credentials."""
+
     def __init__(self, settings: Settings, node_id: str):
         self.settings = settings
         self.node_id = node_id
@@ -101,7 +115,7 @@ class MuseAdapter:
                 json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
             )
             if not isinstance(cfg, dict):
-                raise ValueError("Invalid config")
+                raise ValueError("Invalid muse-cli config.json structure.")
             cookie_path = self.settings.config_dir / "cookies.txt"
             if cfg.get("cookies_file"):
                 from pathlib import Path
@@ -111,17 +125,19 @@ class MuseAdapter:
                     cookie_path = self.settings.config_dir / cookie_path
             cookies = load_cookies(str(cookie_path))
             if not cookies.strip():
-                raise BridgeError(503, "muse_auth_required", "Refresh muse-cli authentication.")
+                raise BridgeError(
+                    503, "muse_auth_required", "Refresh muse-cli authentication first."
+                )
             gateway = Gateway(cookies, vm_id=cfg.get("vm_id"))
             yield MuseSession(gateway, cfg.get("node_id") or self.node_id)
         except BridgeError:
             raise
         except Exception as error:
-            # Some upstream exceptions include URLs, auth tokens or gateway response text.
-            # Deliberately retain none of those in our public errors or exception chains.
+            # Upstream exceptions may contain auth tokens, signed URLs, or raw gateway payloads.
+            # Suppress the original exception chain so sensitive strings are never exposed.
             name = type(error).__name__
             if name in {"AuthError", "FileNotFoundError"}:
-                code, message = "muse_auth_required", "Refresh muse-cli authentication."
+                code, message = "muse_auth_required", "Refresh muse-cli authentication first."
             elif name in {"JSONDecodeError", "TypeError", "ValueError"}:
                 code, message = "muse_config_error", "Check the muse-cli config and cookie paths."
             else:

@@ -1,4 +1,8 @@
-"""Translate Muse's dedicated emotion footer to AIRI ACT; never infer from emoji."""
+"""Convert Muse's invisible emotion footer into an AIRI <|ACT ...|> prefix.
+
+Emotion is determined strictly from the dedicated protocol footer and is never
+inferred from visible text or emoji.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +12,7 @@ from .protocol import INVISIBLE_PROTOCOL, parse_reply
 
 
 def decorate(text: str, enabled: bool = True, *, protocol: str = INVISIBLE_PROTOCOL) -> str:
+    """Strip any recognized emotion footer and optionally prepend an AIRI ACT marker."""
     reply = parse_reply(text, protocol)
     if not enabled:
         return reply.text

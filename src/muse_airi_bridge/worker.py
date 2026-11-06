@@ -1,3 +1,5 @@
+"""Serialized background worker for posting turns and polling Muse history."""
+
 from __future__ import annotations
 
 import threading
@@ -18,15 +20,19 @@ def select_reply(
     expected_text_hash: str,
     protocol: str = INVISIBLE_PROTOCOL,
 ) -> dict | None:
+    """Find the completed assistant reply corresponding to our posted user message."""
     newer = [event for event in events if event["seq"] > baseline]
-    # A completed response to the last owner turn is ambiguous after another client speaks.
+    # If another user message appears after our baseline, reply ownership is ambiguous.
     users = [event for event in newer if event.get("event_name") == "message.user"]
     if len(users) > 1 or any(
         text_hash(event_text(e, protocol)) != expected_text_hash for e in users
     ):
-        raise BridgeError(409, "muse_interference", "Another client posted to the Muse main chat.")
+        raise BridgeError(
+            409, "muse_interference", "Another client posted to the Muse main chat concurrently."
+        )
     if not users:
-        # A late reply to a previous client turn must not be mistaken for our own reply.
+        # Wait until our own user message appears in history so a late reply from a prior
+        # turn cannot be mistaken for the reply to this turn.
         return None
     for event in newer:
         if event["seq"] <= users[0]["seq"]:
@@ -43,6 +49,8 @@ def select_reply(
 
 
 class BridgeWorker:
+    """Coordinate single-turn execution, journal persistence, and manual recovery."""
+
     def __init__(self, settings: Settings, adapter=None):
         self.settings = settings
         self.state_lock = StateLock(settings.state_dir)
@@ -60,10 +68,11 @@ class BridgeWorker:
         self.closed = False
 
     def submit(self, routed: RoutedInput) -> Future:
+        """Submit a conversation turn or attach to an existing in-flight/cached job."""
         with self.mutex:
             if self.closed:
-                raise BridgeError(503, "bridge_stopping", "The bridge is stopping.")
-            # Keep completed results long enough for AIRI's short automatic retry cycle.
+                raise BridgeError(503, "bridge_stopping", "The bridge server is shutting down.")
+            # Prune finished futures; completed jobs remain available via the SQLite journal cache.
             self.futures = {key: value for key, value in self.futures.items() if not value.done()}
             job, created = self.journal.reserve(
                 routed.fingerprint,
@@ -83,12 +92,11 @@ class BridgeWorker:
                 raise BridgeError(
                     409,
                     "muse_turn_uncertain",
-                    "Run reconcile before retrying this pending turn.",
+                    "Run 'reconcile' before retrying this uncertain turn.",
                     job_id=job.job_id,
                 )
             future = self.executor.submit(self._run, job, routed.text)
             self.futures[job.job_id] = future
-            # Exception objects remain safe to retrieve even after an HTTP client disconnects.
             return future
 
     def _run(self, job: Job, original: str) -> Job:
@@ -103,13 +111,14 @@ class BridgeWorker:
                     raise BridgeError(
                         409,
                         "muse_already_working",
-                        "The last Muse owner turn has no completed reply; wait before posting.",
+                        "The previous Muse turn has no completed reply yet; wait before posting.",
                     )
                 baseline = max((e["seq"] for e in history), default=0)
                 self.journal.update(job.job_id, "prepared", baseline=baseline)
                 if self.stop.is_set():
-                    raise BridgeError(503, "bridge_stopping", "The bridge is stopping.")
-                # Commit BEFORE network I/O: a process death can never cause an automatic resend.
+                    raise BridgeError(503, "bridge_stopping", "The bridge server is shutting down.")
+                # Persist 'sending' before network I/O so an unexpected crash never triggers
+                # an automatic duplicate post on restart.
                 self.journal.update(job.job_id, "sending")
                 may_have_sent = True
                 session.send(outbound_text(original, job.protocol))
@@ -118,7 +127,7 @@ class BridgeWorker:
                 while time.monotonic() < deadline:
                     if self.stop.is_set():
                         raise BridgeError(
-                            503, "bridge_stopping", "The bridge stopped after posting."
+                            503, "bridge_stopping", "The bridge stopped after posting the message."
                         )
                     reply = select_reply(session.history(), baseline, job.wire_hash, job.protocol)
                     if reply is not None:
@@ -133,7 +142,9 @@ class BridgeWorker:
                     self.stop.wait(
                         min(self.settings.poll_interval, max(0, deadline - time.monotonic()))
                     )
-                raise BridgeError(504, "muse_reply_timeout", "Muse has not completed a reply yet.")
+                raise BridgeError(
+                    504, "muse_reply_timeout", "Timed out waiting for Muse to complete a reply."
+                )
         except Exception as error:
             public = (
                 error
@@ -150,20 +161,23 @@ class BridgeWorker:
             ) from None
 
     def ready(self) -> dict:
-        # A separate connection owns its receiver; it never consumes the chat worker's frames.
+        """Verify Muse connectivity on a dedicated session without posting."""
+        # Open an independent Gateway connection so its WebSocket receiver never competes
+        # with the background chat worker thread.
         with self.adapter.open() as session:
             session.history()
         return {"status": "ready", "muse": "connected", "message_sent": False}
 
     def reconcile(self, job_id: str) -> Job:
+        """Recover the completed reply for an uncertain job from recent Muse history."""
         job = self.journal.get(job_id)
         if job.state == "completed":
             return job
         if job.state != "uncertain" or job.baseline is None:
-            raise BridgeError(409, "job_not_uncertain", "This job cannot be reconciled.")
+            raise BridgeError(409, "job_not_uncertain", "Only an uncertain job can be reconciled.")
         with self.adapter.open() as session:
             events = session.history()
-        # Reconciliation needs visible evidence that this exact input reached Muse.
+        # Require proof in history that this exact outbound message reached Muse.
         users = [
             e for e in events if e["seq"] > job.baseline and e.get("event_name") == "message.user"
         ]
@@ -171,13 +185,16 @@ class BridgeWorker:
             raise BridgeError(
                 409,
                 "reconcile_unresolved",
-                "The posted input is not identifiable in recent history.",
+                "The posted input was not found in recent Muse history.",
                 job_id=job_id,
             )
         reply = select_reply(events, job.baseline, job.wire_hash, job.protocol)
         if reply is None:
             raise BridgeError(
-                409, "reconcile_unresolved", "No completed reply is visible yet.", job_id=job_id
+                409,
+                "reconcile_unresolved",
+                "No completed reply is visible in recent Muse history yet.",
+                job_id=job_id,
             )
         self.journal.update(
             job_id,
@@ -189,6 +206,7 @@ class BridgeWorker:
         return self.journal.get(job_id)
 
     def clear_pending(self, job_id: str):
+        """Mark an uncertain job as cleared so new turns are no longer blocked."""
         job = self.journal.get(job_id)
         if job.state != "uncertain":
             raise BridgeError(409, "job_not_uncertain", "Only an uncertain job may be cleared.")

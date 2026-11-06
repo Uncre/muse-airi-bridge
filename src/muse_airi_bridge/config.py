@@ -1,3 +1,5 @@
+"""Runtime configuration loaded from environment variables."""
+
 from __future__ import annotations
 
 import math
@@ -8,6 +10,8 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class Settings:
+    """Validated settings for the local bridge server and Muse CLI paths."""
+
     api_key: str = field(default="", repr=False)
     config_dir: Path = field(default_factory=lambda: Path.home() / ".config" / "muse-cli")
     state_dir: Path = field(
@@ -26,16 +30,17 @@ class Settings:
             not math.isfinite(value) or value <= 0
             for value in (self.reply_timeout, self.poll_interval, self.cache_ttl)
         ):
-            raise ValueError("Timeout, poll interval and cache TTL must be positive.")
+            raise ValueError("Timeout, poll interval, and cache TTL must be positive numbers.")
         if not 1 <= self.port <= 65535 or self.max_body_bytes <= 0:
-            raise ValueError("Invalid port or request size limit.")
+            raise ValueError("Port must be between 1 and 65535, and max_body_bytes must be > 0.")
 
     @classmethod
     def from_env(cls) -> Settings:
+        """Load and validate bridge settings from environment variables."""
         defaults = cls()
         boolean = os.environ.get("MUSE_BRIDGE_EMOTIONS", "true").lower()
         if boolean not in {"true", "false", "1", "0"}:
-            raise ValueError("MUSE_BRIDGE_EMOTIONS must be true or false.")
+            raise ValueError("MUSE_BRIDGE_EMOTIONS must be true, false, 1, or 0.")
         return cls(
             api_key=os.environ.get("MUSE_BRIDGE_API_KEY", ""),
             config_dir=Path(os.environ.get("MUSE_BRIDGE_CONFIG_DIR", defaults.config_dir))

@@ -1,8 +1,10 @@
+"""Redacted, OpenAI-formatted error responses for HTTP and CLI callers."""
+
 from __future__ import annotations
 
 
 class BridgeError(Exception):
-    """Public, redacted error. Never expose upstream exceptions to the HTTP client."""
+    """Public error safe to return to clients without leaking upstream details."""
 
     def __init__(self, status: int, code: str, message: str, *, job_id: str | None = None):
         super().__init__(message)
@@ -12,6 +14,7 @@ class BridgeError(Exception):
         self.job_id = job_id
 
     def payload(self) -> dict:
+        """Format the error as an OpenAI-style error JSON object."""
         error = {
             "message": self.message,
             "type": "invalid_request_error" if self.status < 500 else "server_error",

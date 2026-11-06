@@ -1,3 +1,5 @@
+"""SQLite state journal and single-process lock for safe turn deduplication."""
+
 from __future__ import annotations
 
 import json
@@ -17,7 +19,7 @@ SCHEMA_VERSION = 2
 
 
 class StateLock:
-    """One live worker process per journal, including Windows native Python."""
+    """Ensure only one worker process accesses the state directory at a time."""
 
     def __init__(self, directory: Path):
         directory.mkdir(parents=True, exist_ok=True)
@@ -58,6 +60,8 @@ class StateLock:
 
 @dataclass(frozen=True)
 class Job:
+    """Recorded state for a single conversation turn."""
+
     job_id: str
     request_key: str
     text_hash: str
@@ -73,6 +77,8 @@ class Job:
 
 
 class Journal:
+    """Persistent SQLite store tracking turn states, hashes, and cached replies."""
+
     def __init__(self, directory: Path):
         directory.mkdir(parents=True, exist_ok=True)
         self._mutex = threading.RLock()
@@ -84,8 +90,11 @@ class Journal:
             previous = self.db.execute("PRAGMA user_version").fetchone()[0]
             if previous > SCHEMA_VERSION:
                 raise BridgeError(
-                    503, "journal_version_unsupported", "The journal is newer than this bridge."
+                    503,
+                    "journal_version_unsupported",
+                    "The state journal was created by a newer version of this bridge.",
                 )
+            # Create a pre-migration backup before upgrading a 0.1.0 database to schema v2.
             backup_path = directory / "journal.pre-v2.sqlite3"
             if existed and previous < SCHEMA_VERSION and not backup_path.exists():
                 backup = sqlite3.connect(backup_path)
@@ -127,8 +136,9 @@ class Journal:
                     raise BridgeError(
                         503,
                         "journal_protocol_unsupported",
-                        "The journal contains an unsupported protocol.",
+                        "The state journal contains an unsupported wire protocol.",
                     )
+                # Retire failed legacy jobs into tombstones so they cannot be resent with a header.
                 self.db.execute(
                     "UPDATE jobs SET state='cleared',response=NULL,"
                     "error_code='legacy_failed_retired' "
@@ -153,18 +163,22 @@ class Journal:
             return self.db.execute("SELECT value FROM settings WHERE name='node_id'").fetchone()[0]
 
     def recover_interrupted(self):
+        """Transition in-flight jobs left behind by a previous process shutdown."""
         with self._mutex, self.db:
-            # A legacy pending request must never be upgraded into a new wire post.
+            # All pending legacy (raw-v0) jobs become uncertain so they are never upgraded and
+            # reposted under the new invisible-v1 protocol.
             self.db.execute(
                 "UPDATE jobs SET state='uncertain',error_code='legacy_pending' "
                 "WHERE protocol=? AND state IN ('reserved','prepared','sending','waiting')",
                 (LEGACY_PROTOCOL,),
             )
+            # New-protocol jobs interrupted before network send are safe to mark as failed.
             self.db.execute(
                 "UPDATE jobs SET state='failed', error_code='interrupted_before_send' "
                 "WHERE protocol=? AND state IN ('reserved','prepared')",
                 (INVISIBLE_PROTOCOL,),
             )
+            # Jobs interrupted during or after network send may have reached Muse; hold them.
             self.db.execute(
                 "UPDATE jobs SET state='uncertain', error_code='interrupted_after_send' "
                 "WHERE state IN ('sending','waiting')"
@@ -174,7 +188,7 @@ class Journal:
         with self._mutex:
             row = self.db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
             if row is None:
-                raise BridgeError(404, "job_not_found", "Job not found.")
+                raise BridgeError(404, "job_not_found", "Job ID was not found in the journal.")
             return Job(**dict(row))
 
     def reserve(
@@ -186,10 +200,11 @@ class Journal:
         protocol: str = LEGACY_PROTOCOL,
         wire_hash: str | None = None,
     ) -> tuple[Job, bool]:
+        """Reserve a turn slot, or return an existing active/cached job for the same request."""
         if protocol not in SUPPORTED_PROTOCOLS or (
             protocol == INVISIBLE_PROTOCOL and not wire_hash
         ):
-            raise ValueError("An explicit wire hash is required for invisible-v1.")
+            raise ValueError("An explicit wire_hash is required for invisible-v1 jobs.")
         self.prune(ttl)
         with self._mutex, self.db:
             row = self.db.execute("SELECT * FROM jobs WHERE request_key=?", (key,)).fetchone()
@@ -203,14 +218,14 @@ class Journal:
                     raise BridgeError(
                         409,
                         "job_cleared",
-                        "This request was explicitly cleared; send a new turn.",
+                        "This request was cleared; send a new message in AIRI instead.",
                         job_id=job.job_id,
                     )
                 if job.protocol == LEGACY_PROTOCOL:
                     raise BridgeError(
                         409,
                         "legacy_job_retired",
-                        "Send a new turn instead of upgrading a legacy request.",
+                        "Send a new message in AIRI instead of reusing a legacy 0.1.0 request.",
                         job_id=job.job_id,
                     )
                 self.db.execute("DELETE FROM jobs WHERE job_id=?", (job.job_id,))
@@ -222,7 +237,7 @@ class Journal:
                 raise BridgeError(
                     409,
                     "muse_busy",
-                    "Another turn is pending. Resolve it before sending a new one.",
+                    "Another turn is still pending. Resolve it before sending a new message.",
                     job_id=blocked[0],
                 )
             now = time.time()
@@ -238,15 +253,17 @@ class Journal:
     def update(self, job_id: str, state: str, **values):
         allowed = {"baseline", "response", "response_seq", "error_code"}
         if not values.keys() <= allowed:
-            raise ValueError("Invalid journal fields")
+            raise ValueError("Invalid journal update fields.")
         values = {"state": state, "updated_at": time.time(), **values}
         fields = ",".join(f"{key}=?" for key in values)
         with self._mutex, self.db:
             self.db.execute(f"UPDATE jobs SET {fields} WHERE job_id=?", (*values.values(), job_id))
 
     def prune(self, ttl: float):
+        """Expire old completed/failed entries while preserving legacy tombstones."""
         with self._mutex, self.db:
-            # Keep old request identities as tombstones; expiry must not re-post them with a header.
+            # Keep expired legacy request keys as cleared tombstones (without reply text)
+            # so they are never reposted with an invisible header on a late retry.
             self.db.execute(
                 "UPDATE jobs SET state='cleared',response=NULL,error_code='legacy_cache_expired' "
                 "WHERE protocol=? AND state='completed' AND updated_at<?",
@@ -264,6 +281,7 @@ class Journal:
 
 
 def pending_summary(directory: Path) -> list[dict]:
+    """Read pending job metadata in read-only mode without mutating the database."""
     path = directory / "journal.sqlite3"
     if not path.is_file():
         return []
@@ -285,4 +303,5 @@ def pending_summary(directory: Path) -> list[dict]:
 
 
 def print_pending(directory: Path):
-    print(json.dumps({"pending": pending_summary(directory)}, indent=2))
+    """Print pending job metadata as formatted JSON."""
+    print(json.dumps({"pending": pending_summary(directory)}, indent=2, ensure_ascii=False))
