@@ -1,25 +1,28 @@
+[English](README.md) | [日本語](README.ja.md) | [中文](README.zh-CN.md)
+
 # muse-airi-bridge
 
-AIRIの「OpenAI Compatible」プロバイダーから、普段使っているMuseのメインチャットへ接続するためのローカルブリッジ（Python製）です。AIRI本体のコード変更は不要です。
+A local Python bridge that connects [AIRI](https://github.com/moeru-ai/airi)'s "OpenAI Compatible" provider to your existing Muse main chat via [muse-cli](https://github.com/nikships/muse-cli). No modifications to AIRI itself are required.
 
-**Museへ投稿されるのは「不可視の識別ヘッダー（40文字）＋ユーザーの入力原文」のみです。**
-AIRIが付与する日時・返信先・スキル指示・`[Context]` などの装飾はすべて除去し、AIRI側の人格プロンプトや過去の会話履歴は送信しません。Muse側で設定している人格・メモリー・標準ツールをそのまま利用します。
-
----
-
-## 対応環境
-
-- **OS・ツール**: Windows、Python 3.10以上、Git、`uv`
-- **muse-cli**: `muse-cli==0.3.10`
-  - `uv` の仮想環境内に固定バージョンをインストールして使用します（既存のグローバル環境は変更しません）。
-  - 既存の `~/.config/muse-cli/config.json` と `cookies.txt` を**読み取り専用**で利用します。
-- **AIRI**: **v0.14.1** のリクエスト形式を対象としています（調査時点の `main` ブランチでも主要な装飾形式の一致を確認していますが、他バージョンは動作保証外です）。
+**Only a 40-character invisible identification header plus the raw user input is posted to Muse.**
+All decorations added by AIRI (timestamps, reply headers, skill instructions, and `[Context]`) are stripped out, and AIRI's persona prompt and past conversation history are never sent. Muse uses its own configured persona, memory, and built-in tools.
 
 ---
 
-## インストールと起動（PowerShell）
+## Prerequisites & Supported Environment
 
-この `README.md` があるディレクトリで以下を実行します。
+- **Prerequisite Tools**:
+  - [AIRI](https://github.com/moeru-ai/airi): **v0.14.1** request format is targeted (major decoration formats were also verified against `main` at investigation time, but other versions are not guaranteed).
+  - [muse-cli](https://github.com/nikships/muse-cli): `muse-cli==0.3.10`
+    - A pinned version is installed into the `uv` virtual environment without modifying your global environment.
+    - Existing `~/.config/muse-cli/config.json` and `cookies.txt` are used in **read-only** mode.
+- **OS & Runtime**: Windows, Python 3.10+, Git, `uv`
+
+---
+
+## Installation & Startup (PowerShell)
+
+Run the following commands in the directory containing this `README.md`:
 
 ```powershell
 uv sync --locked
@@ -32,156 +35,156 @@ uv run --env-file .env muse-airi-bridge doctor
 uv run --env-file .env muse-airi-bridge serve
 ```
 
-### 設定と運用の注意点
+### Configuration & Operational Notes
 
-- **ローカルAPIキー (`MUSE_BRIDGE_API_KEY`)**
-  - `.env` に設定された `MUSE_BRIDGE_API_KEY` をAIRI側にも設定してください。
-  - これはローカルブリッジ専用の認証キーであり、OpenAIのAPIキーではありません（`.env` はGit管理対象外です）。
-- **接続診断 (`doctor`)**
-  - `doctor` コマンドは履歴の取得のみで接続を確認します。メッセージの投稿、設定ファイルの作成・更新、Cookieの表示は一切行いません。
-  - 認証エラーが出た場合は、通常の `muse-cli` 側でログイン状態を更新してください。
-- **0.1.0からの更新時**
-  - `0.1.0` のサーバーが稼働中の場合は、そのターミナルでサーバーを停止してから `uv sync --locked` を実行し、再起動してください（Windowsでは稼働中の実行ファイルを置き換えられません）。
-- **保存先パスの変更**
-  - `muse-cli` の設定保存先が既定と異なる場合は、`.env` の `MUSE_BRIDGE_CONFIG_DIR` で指定してください（Windows側からWSL内の設定を自動探索することはしません）。
-  - ブリッジの状態保存先の既定値は `~/.local/state/muse-airi-bridge` です（`MUSE_BRIDGE_STATE_DIR` で変更可能）。
+- **Local API Key (`MUSE_BRIDGE_API_KEY`)**
+  - Set the `MUSE_BRIDGE_API_KEY` from `.env` in AIRI as well.
+  - This is an authentication key strictly for the local bridge, not an OpenAI API key (`.env` is gitignored).
+- **Connection Diagnostics (`doctor`)**
+  - The `doctor` command verifies connectivity solely by fetching history. It never posts messages, creates or updates config files, or prints cookies.
+  - If you get an authentication error, refresh your login session using your normal `muse-cli` installation.
+- **Upgrading from `0.1.0`**
+  - If a `0.1.0` server is running, stop it in its terminal before running `uv sync --locked` and restarting (Windows cannot replace executables while they are in use).
+- **Custom Paths**
+  - If your `muse-cli` configuration lives in a non-default location, set `MUSE_BRIDGE_CONFIG_DIR` in `.env` (WSL configuration paths are not auto-discovered from Windows).
+  - The default state directory is `~/.local/state/muse-airi-bridge` (configurable via `MUSE_BRIDGE_STATE_DIR`).
 
 ---
 
-## AIRIの設定
+## AIRI Configuration
 
-| 設定項目 | 設定値 |
+| Setting | Value |
 |---|---|
 | Provider | `OpenAI Compatible` |
 | API protocol | `Chat Completions` |
 | Base URL | `http://127.0.0.1:8000/v1/` |
-| API key | `.env` に設定した `MUSE_BRIDGE_API_KEY` |
+| API key | `MUSE_BRIDGE_API_KEY` configured in `.env` |
 | Model | `muse-airi` |
 
-### AIRI側での利用ルール
+### Usage Rules in AIRI
 
-- **音声・画像機能**: 音声認識（STT）と読み上げ（TTS）はAIRI側で設定します。本ブリッジは文字起こし済みのテキストのみを扱い、音声や画像の生成APIは提供しません。
-- **補助機能への非対応**: 会話履歴は通常の設定を使用し、AIRIの補助機能（Autonomous Artist、Vision、背景レシピ、Spark通知など）の接続先には指定しないでください。確認済みの補助呼び出しはブリッジ側で拒否します。
-- **ツール呼び出し**: AIRIのFunction Toolsは実行しません。`tool_choice` が `auto` または `none` のツール定義は無視し、ツール実行を必須にする指定はエラーとして拒否します。検索や作業の判断・実行はMuse自身が行います。
-- **接続テスト (`ping`)**: AIRIの接続検証用 `ping` に対してはローカルで即座に `pong` を返し、Museへは投稿しません。そのため、`ping` の成功はMuseへの接続成功を意味しません。実際のMuse接続確認には `doctor` コマンドまたは認証付きの `GET /readyz` を使用してください。
+- **Speech & Vision**: Configure speech-to-text (STT) and text-to-speech (TTS) on the AIRI side. This bridge handles transcribed text only and does not provide audio or image generation APIs.
+- **No Auxiliary Sub-Agents**: Keep normal conversation history enabled, and do not point AIRI's auxiliary features (Autonomous Artist, Vision, background recipes, Spark notifications, etc.) to this bridge. Known auxiliary requests are rejected by the bridge.
+- **Function Tools**: AIRI function tools are not executed. Tool definitions with `tool_choice` set to `auto` or `none` are ignored, while required/forced tool calls are rejected with an error. Muse itself decides when and how to search or run tasks.
+- **Connection Probe (`ping`)**: AIRI's `ping` validation probe is answered locally with `pong` without posting to Muse. A passing probe does not imply Muse connectivity; use `doctor` or an authenticated `GET /readyz` request to verify the actual Muse connection.
 
 ---
 
-## Museのソウルへの追記と感情連携
+## Muse Soul Addendum & Emotion Sync
 
-初回利用前に、[ソウル追記用プロンプト](docs/muse-soul-addendum.md) の全文をMuseのソウルへ追記してください。
+Before first use, append the full text of the [Soul Addendum Prompt](docs/muse-soul-addendum.md) to your Muse's Soul.
 
-- このプロジェクトがソウルを自動編集することはありません。
-- `docs/muse-soul-addendum.md` には実際の不可視ヘッダーと9種類の不可視フッターが含まれています。不可視文字を除去するエディターや変換処理を挟まずに、そのままコピー＆ペーストしてください。
+- This project never edits your Muse Soul automatically.
+- `docs/muse-soul-addendum.md` contains the actual invisible header and all 9 invisible footers. Copy and paste it directly without passing it through editors or converters that strip zero-width characters.
 
-### 不可視プロトコルの仕組み
+### How the Invisible Protocol Works
 
-1. **入力ヘッダーの付与**
-   - ブリッジは抽出原文の先頭に、ASCII文字列 `AIRI1` を符号化した40文字の不可視ヘッダーを付与してMuseへ投稿します。
-   - 符号化規則は `U+200B = 0`、`U+200C = 1` とし、各バイトを上位ビット（MSB）から8文字へ展開します。
-2. **Museによる感情フッターの付与**
-   - Museは「現在回答する発言がこの不可視ヘッダーで始まる場合のみ」自身の感情を1つ選び、返信の絶対末尾に `AE1:`＋感情コード1文字（計5バイト＝不可視文字40文字）を付与します。
+1. **Prepending the Input Header**
+   - The bridge prepends a 40-character invisible header encoding the ASCII string `AIRI1` to the extracted user text before posting to Muse.
+   - Each byte is encoded MSB-first into 8 characters using `U+200B = 0` and `U+200C = 1`.
+2. **Appending the Emotion Footer by Muse**
+   - Only when the current user message begins with this invisible header, Muse selects one primary emotion for its response and appends `AE1:` + a 1-character emotion code (5 bytes = 40 invisible characters) at the very end of the reply.
 
-| コード | AIRIの感情名 |
+| Code | AIRI Emotion |
 |---|---|
 | `N` / `H` / `S` / `A` | `neutral` / `happy` / `sad` / `angry` |
 | `T` / `U` / `W` | `think` / `surprised` / `awkward` |
 | `Q` / `C` | `question` / `curious` |
 
-3. **返信の取得と `ACT` マーカーへの変換**
-   - ブリッジはMuseの最初の完成返信を取得してからSSE（またはJSON）で返します。生成途中のトークンを逐次流す方式ではありません（待機時間は既定300秒、履歴ポーリングは1秒間隔）。
-   - 返信は `payload.content` から読み取り、末尾の専用フッターを除去したうえで、先頭に `<|ACT {"emotion":{"name":"happy","intensity":0.6}}|>` 形式のマーカーを1個付与します（`neutral` の強度は `1`、それ以外は `0.6`）。
-   - 本文や絵文字からの感情推定、修復用の追加AI呼び出し、再投稿は一切行いません。
+3. **Collecting the Reply & Converting to an `ACT` Marker**
+   - The bridge waits for Muse's first completed reply before returning it via SSE (or JSON); it does not stream tokens live during generation (default timeout: 300s, history poll interval: 1s).
+   - It reads the reply from `payload.content`, strips the dedicated trailing footer, and prepends a single `<|ACT {"emotion":{"name":"happy","intensity":0.6}}|>` marker (`intensity` is `1` for `neutral` and `0.6` for all other emotions).
+   - It never infers emotion from body text or emoji, makes no extra LLM repair calls, and never reposts messages.
 
-### フッター異常時のフォールバック
+### Fallback Behavior for Malformed Footers
 
-- **フッター欠落時**: `neutral` として扱います。
-- **未知コード・破損コード**: 末尾40文字に固定の32文字署名（`AE1:`）を確認できる場合、未知または破損した感情コードであればそのフッターを除去して `neutral` にします。
-- **重複フッター**: 専用フッターが末尾に連続して複数付いている場合は、その専用フッター列をすべて除去して `neutral` にします。
-- **署名破損・途中切断・末尾の余剰文字**: 署名自体の破損、途中で切れた符号、フッターの後ろに空白や改行がある場合は正しいフッターと認識せず、元の文字列を保ったまま `neutral` にします。本文中や引用中の不可視文字を一括削除することもありません。
-- **感情マーカーの無効化**: `.env` で `MUSE_BRIDGE_EMOTIONS=false` を設定すると、`ACT` マーカーの追加のみを無効化します（入力ヘッダーの付与と、識別できた返信フッターの除去は引き続き行われます）。なお、実際の表情の見え方はアバターモデルが持つモーションに依存します。
+- **Missing Footer**: Treated as `neutral`.
+- **Unknown or Corrupted Emotion Code**: If the trailing 40 characters start with the valid 32-character `AE1:` signature, an unknown or corrupted code byte is stripped and treated as `neutral`.
+- **Duplicate Footers**: If multiple dedicated footers appear contiguously at the end, the entire trailing footer sequence is stripped and treated as `neutral`.
+- **Damaged Signature, Truncated Code, or Trailing Whitespace**: If the signature itself is damaged, the code is truncated, or whitespace/newlines follow the footer, it is not recognized as a footer; the original string is preserved intact and treated as `neutral`. Invisible characters inside the body or inside quotes are never bulk-deleted.
+- **Disabling Emotion Markers**: Setting `MUSE_BRIDGE_EMOTIONS=false` in `.env` disables only the insertion of the `<|ACT ...|>` marker (the invisible input header is still sent and recognizable reply footers are still stripped). Visual expression in AIRI depends on the motions supported by your avatar model.
 
 ---
 
-## API仕様
+## API Specification
 
-| エンドポイント | 説明 |
+| Endpoint | Description |
 |---|---|
-| `GET /healthz` | プロセスの生存確認（Museへの接続確認は行わない） |
-| `GET /readyz` | Museの履歴を読み取る接続診断（投稿は行わない） |
-| `GET /v1/models` | ローカルモデル一覧の取得 |
-| `POST /v1/chat/completions` | 会話エンドポイント（通常JSONとSSEストリーミングに対応） |
+| `GET /healthz` | Process liveness check (does not check Muse) |
+| `GET /readyz` | Muse connectivity check via history read (never posts) |
+| `GET /v1/models` | List local bridge models |
+| `POST /v1/chat/completions` | Chat endpoint (supports both JSON and SSE streaming) |
 
-### 認証とネットワーク
+### Authentication & Networking
 
-- `/healthz` 以外のすべてのエンドポイントで `Authorization: Bearer <local-key>` ヘッダーが必要です。
-- CORSプリフライト（`OPTIONS`）は認証なしで応答します。CORSは全Origin（`*`）を許可しますが、Cookie認証は使わずBearerキーを必須としています。既定の待受先はループバック（`127.0.0.1`）のみです。
+- All endpoints except `/healthz` require an `Authorization: Bearer <local-key>` header.
+- CORS preflight (`OPTIONS`) requests respond without authentication. CORS allows all origins (`*`), uses no cookies, and requires a Bearer key. By default, the server binds to loopback (`127.0.0.1`) only.
 
-### 対応パラメータとリクエスト判別
+### Supported Parameters & Request Routing
 
-- Chat Completionsの **AIRI向けサブセット** であり、一般的なステートレスLLMの代替ではありません。
-- **入力形式の検証**: 通常入力にはAIRI v0.14.1の日時接頭辞（`[YYYY-MM-DD HH:MM] `）が必要です。`system` / `developer` メッセージがある場合は、AIRIの通常チャット用フォーマットであることを確認します。装飾のないプレーンな `user` 本文を推測で転送するフォールバックはありません。
-- **受理するパラメータ**: `messages`（文字列またはテキスト配列）、`stream`、`n=1` に対応します。`temperature`、`top_p`、`max_tokens`、`max_completion_tokens` は受理しますが、Museへ適用できないため無視します。使用トークン数（`usage`）は返しません。
-- **非対応の機能**: `stop`、JSON等の構造化出力指定（`response_format`）、ツール実行結果の継続、画像・音声バイナリ・ファイル入力、Responses APIは対象外です。
-- **ローカル接続検証の判別**: 「単独の `user` メッセージ `"ping"`、トークン上限 `16`、非ストリーミング、追加指示・ツールなし」という確認済みの形式でローカル検証と判別します。通常会話で入力した `ping` には日時接頭辞が付くため、通常どおりMuseへ送信されます。レスポンスヘッダー `X-Muse-Bridge-Response` で `local-probe` と `muse` を区別できます。
+- Implements an **AIRI-specific subset** of Chat Completions, not a general-purpose stateless LLM API.
+- **Input Envelope Verification**: Normal chat inputs must begin with AIRI v0.14.1's datetime prefix (`[YYYY-MM-DD HH:MM] `). When `system` or `developer` messages are present, the bridge verifies that they match AIRI's standard chat prompt format. There is no fallback that guesses and forwards undecorated plain user text.
+- **Accepted Parameters**: Supports string or text-part array `messages`, `stream`, and `n=1`. Accepts `temperature`, `top_p`, `max_tokens`, and `max_completion_tokens` for compatibility, but ignores them because they cannot be applied to Muse. Token `usage` is omitted.
+- **Unsupported Features**: `stop`, structured output (`response_format`), tool-result continuations, image/audio binary/file inputs, and the Responses API are rejected.
+- **Local Probe Detection**: Identified by the exact verified shape: a single `user` message `"ping"`, token limit `16`, non-streaming, with no extra instructions or tools. A `"ping"` typed in normal chat carries a datetime prefix and is sent to Muse as usual. The `X-Muse-Bridge-Response` header distinguishes `local-probe` from `muse`.
 
 ---
 
-## 再試行・中断からの回復
+## Retries & Recovery from Interruption
 
-### 直列実行と競合防止
+### Serialized Turns & Conflict Prevention
 
-- 同時に扱う新規発言は1件のみです。MuseのWeb画面や別クライアントから同時に発言しないでください。待機中に別の発言が履歴に現れた場合は競合エラー（`409 / muse_interference`）とします。
-- Museのメインチャットに未完了の発言が残っている場合も、新しい投稿をブロックします（以前の処理の遅い返信を、今回の発言への回答と誤って対応づけることを防ぐためです）。
+- Only one new turn is processed at a time. Do not post simultaneously from the Muse Web UI or another client; if another user message appears in history while waiting, the bridge raises a conflict error (`409 / muse_interference`).
+- New posts are also blocked if an unfinished user turn is already visible in Muse's main chat, preventing a late reply from an earlier turn from being mistaken for the current answer.
 
-### ジャーナル（SQLite）とデータ保護
+### SQLite Journal & Data Privacy
 
-- リクエストのハッシュ、原文のハッシュ、実際に投稿したヘッダー付き本文のハッシュ（`wire_hash`）、プロトコル方式、送信前の履歴位置（`baseline`）、ジョブ状態、取得した返信をSQLiteに保存します。
-- 同一リクエストが再送された場合は、処理中のジョブまたは10分以内の完了キャッシュを共有します。
-- 生のユーザー入力と認証情報は保存しませんが、**不可視フッターを含む返信本文は状態DBに保存されます**。状態ディレクトリ（および移行前バックアップ）は会話データとして適切に保護してください。
+- The bridge records the request hash, original text hash, outbound header+text hash (`wire_hash`), protocol version, pre-send history sequence (`baseline`), job state, and collected reply in SQLite.
+- Retries of an identical request share the in-flight job or replay a completed result cached within 10 minutes.
+- Raw user inputs and credentials are never stored, but **reply text (including the invisible footer) is stored in the state database**. Treat the state directory (and any pre-migration backup) as sensitive conversation data.
 
-### 0.1.0からのDB自動移行
+### Automatic Database Migration from `0.1.0`
 
-- `0.1.0` のDBは起動時に自動移行され、移行前のバックアップ `journal.pre-v2.sqlite3` が状態ディレクトリに作成されます。
-- 旧ジョブは `raw-v0`、新ジョブは `invisible-v1` として区別されます。
-  - **旧保留ジョブ**: 照合（`reconcile`）または明示的な保留解除（`clear-pending`）を行うまで新規投稿を止め、新方式（ヘッダー付き）で再投稿することはありません。
-  - **旧完了キャッシュ**: 10分以内のものは `neutral` として再生し、不可視フッターとしての再解釈は行いません。
-  - **期限切れの旧キャッシュ・旧失敗ジョブ**: 新方式での誤再投稿を防ぐため識別記録（tombstone）を残します。同じリクエストを再送するのではなく、AIRI側で新しい発言を作成してください。
-- 新方式（`invisible-v1`）で `payload.content` が取得できない場合は、表示用フィールドから推測せず `muse_content_missing` エラーにします（投稿後であれば保留状態になり、自動再投稿はしません）。旧ジョブ（`raw-v0`）の履歴照合時のみ、`0.1.0` と同じ表示用フィールド優先順を維持します。
+- A `0.1.0` database is migrated automatically on startup after creating a backup at `journal.pre-v2.sqlite3` in the state directory.
+- Legacy jobs are recorded as `raw-v0` and new jobs as `invisible-v1`:
+  - **Legacy Pending Jobs**: Block new posts until reconciled (`reconcile`) or explicitly cleared (`clear-pending`), and are never upgraded or reposted with the new header protocol.
+  - **Legacy Completed Cache**: Replayed as `neutral` within the 10-minute TTL without re-interpreting invisible footers.
+  - **Expired Legacy Cache & Failed Jobs**: Retained as cleared tombstone records (without reply text) to prevent accidental reposting under the new protocol. Send a new message in AIRI rather than retrying the old request.
+- Under `invisible-v1`, if `payload.content` is missing from a Muse event, the bridge raises `muse_content_missing` rather than guessing from display fields (if already posted, the job enters `uncertain` and is not auto-reposted). Only legacy `raw-v0` reconciliation preserves the `0.1.0` display-field fallback order.
 
-### 切断時の挙動と保留ジョブの操作
+### Client Disconnections & Managing Pending Jobs
 
-- HTTPクライアントの接続切断はMuseの作業キャンセルにはならず、投稿後はバックグラウンドで返信回収を続けます。
-- タイムアウト・送信成否不明・プロセス停止後は、成否不明の投稿を自動再送せず保留（`uncertain`）状態にします。
+- Disconnecting an HTTP client does not cancel Muse's work; once posted, the background worker continues polling to collect the reply.
+- After a timeout, an uncertain send error, or a process restart during an active turn, the job is held as `uncertain` rather than automatically resent.
 
 ```powershell
-# サーバー稼働中でも、保留ジョブのID・状態のみ安全に確認できます（会話本文は表示しません）。
+# Safe to run even while the server is running (prints job IDs and states only, never conversation text):
 uv run --env-file .env muse-airi-bridge pending
 
-# 以下のコマンドはサーバーを停止してから実行してください。
-# 最近の履歴と照合して、完了済みの返信を回収します（新規投稿はしません）。
+# Stop the server before running the commands below.
+# Match an uncertain job against recent Muse history to recover its completed reply (never posts):
 uv run --env-file .env muse-airi-bridge reconcile JOB_ID
 
-# Museがまだ作業中である可能性を確認したうえで、保留ジョブを放棄する場合のみ実行します。
+# Abandon an uncertain job only after confirming Muse may still be working:
 uv run --env-file .env muse-airi-bridge clear-pending JOB_ID --acknowledge-muse-may-still-be-working
 ```
 
-- 照合できないジョブの保留解除（`clear-pending`）はMuse側の作業停止ではありません。解除後は同じリクエストを再送せず、AIRIで新しい発言を作成してください（解除済みリクエストの即時再送は拒否されます）。
-- 複数のサーバープロセスで同じ状態DBを共有する起動もロックにより拒否されます。
+- Clearing a pending job (`clear-pending`) does not stop Muse on the remote side. After clearing, create a new turn in AIRI instead of resending the cleared request (immediate retries of a cleared request are rejected).
+- Starting multiple bridge processes against the same state directory is also blocked by a file lock.
 
 ---
 
-## 初版の制約
+## V1 Limitations
 
-- 最初の完成返信より後に届く自発通知や、非同期作業の続報はAIRIへ配信しません。
-- AIRIの発言IDがAPIリクエストに含まれないため、会話履歴を0件にして同一分内にまったく同じ本文を送るケースは区別できません。
-- ユーザーが `[Context]` などの装飾用区切りと同一の文字列を入力する衝突ケースは、初版では考慮しません。
-- 入力種別の判別は確認済みのAIRIリクエスト形式に依存します。AIRIのアップデートで形式が変わった場合は、原文抽出と拒否テストを更新してから利用してください。
-- `reconcile` が調べる履歴は直近100イベントです。大量のイベント更新があった後は照合できない場合があります。
+- Proactive notifications or follow-up messages arriving after the first completed reply are not pushed to AIRI.
+- Because AIRI does not include message IDs in API requests, sending the exact same text within the same minute with conversation history length set to `0` cannot be distinguished.
+- Collisions where a user manually types internal delimiter strings such as `\n[Context]\n` are not handled in v1.
+- Request classification relies on AIRI v0.14.1's prompt structure. If an AIRI update changes its prompt templates, update the extraction rules and rejection tests before use.
+- `reconcile` inspects the most recent 100 history events; reconciliation may fail if more than 100 events occurred since the turn was posted.
 
 ---
 
-## 開発とコード管理
+## Development & Repository Management
 
 ```powershell
 uv sync --locked
@@ -192,10 +195,10 @@ uv build
 git status
 ```
 
-- `pyproject.toml`、`uv.lock`、`.python-version` をGitで管理します。`.venv`、認証情報（`.env`）、状態DB、ビルド成果物（`dist/`）は管理対象外です。
-- コードを変更せずにAPI契約を検証するブラックボックステストも含まれています。
-- **実機での最終確認手順**:
-  1. Museのソウルへ [docs/muse-soul-addendum.md](docs/muse-soul-addendum.md) を追記します。
-  2. AIRIから短い発言を送ります。
-  3. Museの履歴に「不可視ヘッダー＋原文」が1件だけ追加され、返信末尾の専用フッターが `ACT` マーカーへ変換されて、AIRI側の表示・読み上げ・口パク・表情が動作することを確認してください。
-- 設計と調査根拠は [docs/design.md](docs/design.md)、実施済みの検証結果と未検証項目は [docs/verification.md](docs/verification.md) を参照してください。
+- `pyproject.toml`, `uv.lock`, and `.python-version` are tracked in Git. `.venv`, credentials (`.env`), the state database, and build artifacts (`dist/`) are gitignored.
+- The test suite includes black-box HTTP/SSE contract tests.
+- **Final Verification on Your Environment**:
+  1. Append [docs/muse-soul-addendum.md](docs/muse-soul-addendum.md) to your Muse's Soul.
+  2. Send a short message from AIRI.
+  3. Confirm that a single "invisible header + raw input" message appears in Muse history, and that the trailing emotion footer is converted into an `ACT` marker driving AIRI's text display, TTS, lip-sync, and avatar expression.
+- See [docs/design.md](docs/design.md) for architecture and source references, and [docs/verification.md](docs/verification.md) for completed verification results and remaining manual checks.
