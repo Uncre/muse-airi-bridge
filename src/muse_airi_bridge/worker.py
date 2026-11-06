@@ -8,14 +8,22 @@ from .config import Settings
 from .errors import BridgeError
 from .journal import Job, Journal, StateLock
 from .muse import MuseAdapter, eligible_reply, event_text, payload, text_hash
+from .protocol import INVISIBLE_PROTOCOL, outbound_text
 from .requests import RoutedInput
 
 
-def select_reply(events: list[dict], baseline: int, expected_text_hash: str) -> dict | None:
+def select_reply(
+    events: list[dict],
+    baseline: int,
+    expected_text_hash: str,
+    protocol: str = INVISIBLE_PROTOCOL,
+) -> dict | None:
     newer = [event for event in events if event["seq"] > baseline]
     # A completed response to the last owner turn is ambiguous after another client speaks.
     users = [event for event in newer if event.get("event_name") == "message.user"]
-    if len(users) > 1 or any(text_hash(event_text(e)) != expected_text_hash for e in users):
+    if len(users) > 1 or any(
+        text_hash(event_text(e, protocol)) != expected_text_hash for e in users
+    ):
         raise BridgeError(409, "muse_interference", "Another client posted to the Muse main chat.")
     if not users:
         # A late reply to a previous client turn must not be mistaken for our own reply.
@@ -23,7 +31,7 @@ def select_reply(events: list[dict], baseline: int, expected_text_hash: str) -> 
     for event in newer:
         if event["seq"] <= users[0]["seq"]:
             continue
-        if eligible_reply(event, baseline):
+        if eligible_reply(event, baseline, protocol):
             return event
         if (
             event.get("event_name") == "message.assistant"
@@ -57,9 +65,12 @@ class BridgeWorker:
                 raise BridgeError(503, "bridge_stopping", "The bridge is stopping.")
             # Keep completed results long enough for AIRI's short automatic retry cycle.
             self.futures = {key: value for key, value in self.futures.items() if not value.done()}
-            self.journal.prune(self.settings.cache_ttl)
             job, created = self.journal.reserve(
-                routed.fingerprint, text_hash(routed.text), self.settings.cache_ttl
+                routed.fingerprint,
+                text_hash(routed.text),
+                self.settings.cache_ttl,
+                protocol=INVISIBLE_PROTOCOL,
+                wire_hash=text_hash(outbound_text(routed.text)),
             )
             if not created:
                 if job.state == "completed":
@@ -101,7 +112,7 @@ class BridgeWorker:
                 # Commit BEFORE network I/O: a process death can never cause an automatic resend.
                 self.journal.update(job.job_id, "sending")
                 may_have_sent = True
-                session.send(original)
+                session.send(outbound_text(original, job.protocol))
                 self.journal.update(job.job_id, "waiting")
                 deadline = time.monotonic() + self.settings.reply_timeout
                 while time.monotonic() < deadline:
@@ -109,12 +120,12 @@ class BridgeWorker:
                         raise BridgeError(
                             503, "bridge_stopping", "The bridge stopped after posting."
                         )
-                    reply = select_reply(session.history(), baseline, job.text_hash)
+                    reply = select_reply(session.history(), baseline, job.wire_hash, job.protocol)
                     if reply is not None:
                         self.journal.update(
                             job.job_id,
                             "completed",
-                            response=event_text(reply),
+                            response=event_text(reply, job.protocol),
                             response_seq=reply["seq"],
                             error_code=None,
                         )
@@ -156,14 +167,14 @@ class BridgeWorker:
         users = [
             e for e in events if e["seq"] > job.baseline and e.get("event_name") == "message.user"
         ]
-        if not users or text_hash(event_text(users[0])) != job.text_hash:
+        if not users or text_hash(event_text(users[0], job.protocol)) != job.wire_hash:
             raise BridgeError(
                 409,
                 "reconcile_unresolved",
                 "The posted input is not identifiable in recent history.",
                 job_id=job_id,
             )
-        reply = select_reply(events, job.baseline, job.text_hash)
+        reply = select_reply(events, job.baseline, job.wire_hash, job.protocol)
         if reply is None:
             raise BridgeError(
                 409, "reconcile_unresolved", "No completed reply is visible yet.", job_id=job_id
@@ -171,7 +182,7 @@ class BridgeWorker:
         self.journal.update(
             job_id,
             "completed",
-            response=event_text(reply),
+            response=event_text(reply, job.protocol),
             response_seq=reply["seq"],
             error_code=None,
         )
@@ -181,7 +192,7 @@ class BridgeWorker:
         job = self.journal.get(job_id)
         if job.state != "uncertain":
             raise BridgeError(409, "job_not_uncertain", "Only an uncertain job may be cleared.")
-        self.journal.update(job_id, "cleared", error_code="operator_cleared")
+        self.journal.update(job_id, "cleared", response=None, error_code="operator_cleared")
 
     def close(self):
         with self.mutex:

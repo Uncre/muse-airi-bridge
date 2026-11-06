@@ -10,6 +10,7 @@ from typing import Protocol
 
 from .config import Settings
 from .errors import BridgeError
+from .protocol import INVISIBLE_PROTOCOL, LEGACY_PROTOCOL
 
 
 def text_hash(text: str) -> str:
@@ -21,20 +22,29 @@ def payload(event: dict) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def event_text(event: dict) -> str:
+def event_text(event: dict, protocol: str = LEGACY_PROTOCOL) -> str:
     p = payload(event)
+    if protocol == INVISIBLE_PROTOCOL:
+        value = p.get("content")
+        if not isinstance(value, str):
+            raise BridgeError(
+                502, "muse_content_missing", "Muse payload.content is required for invisible-v1."
+            )
+        return value
+    if protocol != LEGACY_PROTOCOL:
+        raise ValueError("Unsupported event text protocol.")
     value = p.get("display_text") or p.get("content") or ""
     return value if isinstance(value, str) else ""
 
 
-def eligible_reply(event: dict, baseline: int) -> bool:
+def eligible_reply(event: dict, baseline: int, protocol: str = LEGACY_PROTOCOL) -> bool:
     p = payload(event)
     return (
         event.get("event_name") == "message.assistant"
         and event["seq"] > baseline
         and p.get("status") == "completed"
         and not (event.get("reply_to_message_id") or p.get("reply_to_message_id"))
-        and bool(event_text(event))
+        and bool(event_text(event, protocol))
     )
 
 

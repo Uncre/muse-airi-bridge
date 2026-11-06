@@ -134,7 +134,7 @@ def create_app(settings: Settings | None = None, *, adapter=None) -> FastAPI:
             if not future.done() and await request.is_disconnected():
                 return Response(status_code=499)
         job = await asyncio.shield(future)
-        content = decorate(job.response or "", settings.emotions)
+        content = decorate(job.response or "", settings.emotions, protocol=job.protocol)
         response_id = "chatcmpl-" + job.job_id
         created = int(job.created_at)
         headers = {"X-Muse-Bridge-Response": "muse", "X-Muse-Bridge-Job": job.job_id}

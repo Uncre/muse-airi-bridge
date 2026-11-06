@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from muse_airi_bridge.api import create_app
+from muse_airi_bridge.protocol import EMOTION_CODES, emotion_footer, outbound_text
 
 from .fakes import FakeAdapter, conversation, settings
 
@@ -94,7 +95,7 @@ def test_openai_response_envelope_and_original_only_post(tmp_path, stream):
         # The same JSON extraction contract as AIRI's parseActEmotion.
         assert json.loads(marker[len("<|ACT ") :])["emotion"]["name"] == "happy"
         assert reply == "回答です😊"
-        assert adapter.sent == [original]
+        assert adapter.sent == [outbound_text(original)]
         replay = client.post(
             "/v1/chat/completions", json=conversation(original, stream=False), headers=headers
         )
@@ -171,3 +172,37 @@ def test_emotion_decoration_can_be_disabled(tmp_path):
             headers={"Authorization": "Bearer " + config.api_key},
         )
         assert response.json()["choices"][0]["message"]["content"] == "回答です😊"
+
+
+@pytest.mark.parametrize("emotion", EMOTION_CODES.values())
+def test_all_nine_muse_emotions_are_translated_and_cached_without_footer_leak(tmp_path, emotion):
+    config = settings(tmp_path)
+    body = " 本文\n絵文字は😡でも感情はMuseのコードを使う\n"
+    adapter = FakeAdapter(reply_text=body + emotion_footer(emotion))
+    with TestClient(create_app(config, adapter=adapter)) as client:
+        headers = {"Authorization": "Bearer " + config.api_key}
+        first = client.post("/v1/chat/completions", json=conversation("原文"), headers=headers)
+        second = client.post("/v1/chat/completions", json=conversation("原文"), headers=headers)
+        assert first.json() == second.json()
+        content = first.json()["choices"][0]["message"]["content"]
+        marker, visible = content.split("|>", 1)
+        assert json.loads(marker[len("<|ACT ") :])["emotion"]["name"] == emotion
+        assert visible == body
+        assert adapter.sent == [outbound_text("原文")]
+
+
+def test_missing_footer_defaults_to_neutral_without_repair_call_or_repost(tmp_path):
+    config = settings(tmp_path)
+    adapter = FakeAdapter(reply_text="😊嬉しいように見えてもコードなし")
+    with TestClient(create_app(config, adapter=adapter)) as client:
+        result = client.post(
+            "/v1/chat/completions",
+            json=conversation("原文"),
+            headers={"Authorization": "Bearer " + config.api_key},
+        )
+        assert result.status_code == 200
+        content = result.json()["choices"][0]["message"]["content"]
+        assert '"name":"neutral"' in content
+        assert content.split("|>", 1)[1] == adapter.reply_text
+        assert len(adapter.sent) == 1
+        assert adapter.opens == 1

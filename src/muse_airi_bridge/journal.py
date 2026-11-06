@@ -10,8 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import BridgeError
+from .protocol import INVISIBLE_PROTOCOL, LEGACY_PROTOCOL, SUPPORTED_PROTOCOLS
 
 PENDING = ("reserved", "prepared", "sending", "waiting", "uncertain")
+SCHEMA_VERSION = 2
 
 
 class StateLock:
@@ -59,6 +61,8 @@ class Job:
     job_id: str
     request_key: str
     text_hash: str
+    protocol: str
+    wire_hash: str
     state: str
     created_at: float
     updated_at: float
@@ -72,25 +76,77 @@ class Journal:
     def __init__(self, directory: Path):
         directory.mkdir(parents=True, exist_ok=True)
         self._mutex = threading.RLock()
-        self.db = sqlite3.connect(directory / "journal.sqlite3", check_same_thread=False)
+        path = directory / "journal.sqlite3"
+        existed = path.is_file()
+        self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-                job_id TEXT PRIMARY KEY, request_key TEXT NOT NULL UNIQUE,
-                text_hash TEXT NOT NULL, state TEXT NOT NULL,
-                created_at REAL NOT NULL, updated_at REAL NOT NULL,
-                baseline INTEGER, response TEXT, response_seq INTEGER, error_code TEXT
-            );
-            CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
-            """
-        )
-        with self.db:
-            self.db.execute(
-                "INSERT OR IGNORE INTO settings VALUES ('node_id', ?)",
-                ("airi-" + uuid.uuid4().hex[:16],),
-            )
+        try:
+            previous = self.db.execute("PRAGMA user_version").fetchone()[0]
+            if previous > SCHEMA_VERSION:
+                raise BridgeError(
+                    503, "journal_version_unsupported", "The journal is newer than this bridge."
+                )
+            backup_path = directory / "journal.pre-v2.sqlite3"
+            if existed and previous < SCHEMA_VERSION and not backup_path.exists():
+                backup = sqlite3.connect(backup_path)
+                try:
+                    self.db.backup(backup)
+                finally:
+                    backup.close()
+            self.db.execute("PRAGMA journal_mode=WAL")
+            with self.db:
+                self.db.execute("BEGIN IMMEDIATE")
+                self.db.execute(
+                    """CREATE TABLE IF NOT EXISTS jobs (
+                        job_id TEXT PRIMARY KEY, request_key TEXT NOT NULL UNIQUE,
+                        text_hash TEXT NOT NULL, state TEXT NOT NULL,
+                        created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                        baseline INTEGER, response TEXT, response_seq INTEGER, error_code TEXT,
+                        protocol TEXT NOT NULL DEFAULT 'raw-v0',
+                        wire_hash TEXT NOT NULL DEFAULT ''
+                    )"""
+                )
+                self.db.execute(
+                    "CREATE TABLE IF NOT EXISTS settings "
+                    "(name TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
+                if "protocol" not in columns:
+                    self.db.execute(
+                        "ALTER TABLE jobs ADD COLUMN protocol TEXT NOT NULL DEFAULT 'raw-v0'"
+                    )
+                if "wire_hash" not in columns:
+                    self.db.execute("ALTER TABLE jobs ADD COLUMN wire_hash TEXT")
+                self.db.execute(
+                    "UPDATE jobs SET wire_hash=text_hash WHERE wire_hash IS NULL OR wire_hash=''"
+                )
+                if self.db.execute(
+                    "SELECT 1 FROM jobs WHERE protocol NOT IN (?,?) LIMIT 1",
+                    tuple(sorted(SUPPORTED_PROTOCOLS)),
+                ).fetchone():
+                    raise BridgeError(
+                        503,
+                        "journal_protocol_unsupported",
+                        "The journal contains an unsupported protocol.",
+                    )
+                self.db.execute(
+                    "UPDATE jobs SET state='cleared',response=NULL,"
+                    "error_code='legacy_failed_retired' "
+                    "WHERE protocol=? AND state='failed'",
+                    (LEGACY_PROTOCOL,),
+                )
+                self.db.execute(
+                    "UPDATE jobs SET response=NULL WHERE protocol=? AND state='cleared'",
+                    (LEGACY_PROTOCOL,),
+                )
+                self.db.execute(
+                    "INSERT OR IGNORE INTO settings VALUES ('node_id', ?)",
+                    ("airi-" + uuid.uuid4().hex[:16],),
+                )
+                self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        except BaseException:
+            self.db.close()
+            raise
 
     def node_id(self) -> str:
         with self._mutex:
@@ -98,9 +154,16 @@ class Journal:
 
     def recover_interrupted(self):
         with self._mutex, self.db:
+            # A legacy pending request must never be upgraded into a new wire post.
+            self.db.execute(
+                "UPDATE jobs SET state='uncertain',error_code='legacy_pending' "
+                "WHERE protocol=? AND state IN ('reserved','prepared','sending','waiting')",
+                (LEGACY_PROTOCOL,),
+            )
             self.db.execute(
                 "UPDATE jobs SET state='failed', error_code='interrupted_before_send' "
-                "WHERE state IN ('reserved','prepared')"
+                "WHERE protocol=? AND state IN ('reserved','prepared')",
+                (INVISIBLE_PROTOCOL,),
             )
             self.db.execute(
                 "UPDATE jobs SET state='uncertain', error_code='interrupted_after_send' "
@@ -114,7 +177,20 @@ class Journal:
                 raise BridgeError(404, "job_not_found", "Job not found.")
             return Job(**dict(row))
 
-    def reserve(self, key: str, text_hash: str, ttl: float) -> tuple[Job, bool]:
+    def reserve(
+        self,
+        key: str,
+        text_hash: str,
+        ttl: float,
+        *,
+        protocol: str = LEGACY_PROTOCOL,
+        wire_hash: str | None = None,
+    ) -> tuple[Job, bool]:
+        if protocol not in SUPPORTED_PROTOCOLS or (
+            protocol == INVISIBLE_PROTOCOL and not wire_hash
+        ):
+            raise ValueError("An explicit wire hash is required for invisible-v1.")
+        self.prune(ttl)
         with self._mutex, self.db:
             row = self.db.execute("SELECT * FROM jobs WHERE request_key=?", (key,)).fetchone()
             if row is not None:
@@ -128,6 +204,13 @@ class Journal:
                         409,
                         "job_cleared",
                         "This request was explicitly cleared; send a new turn.",
+                        job_id=job.job_id,
+                    )
+                if job.protocol == LEGACY_PROTOCOL:
+                    raise BridgeError(
+                        409,
+                        "legacy_job_retired",
+                        "Send a new turn instead of upgrading a legacy request.",
                         job_id=job.job_id,
                     )
                 self.db.execute("DELETE FROM jobs WHERE job_id=?", (job.job_id,))
@@ -145,9 +228,10 @@ class Journal:
             now = time.time()
             job_id = uuid.uuid4().hex
             self.db.execute(
-                "INSERT INTO jobs (job_id,request_key,text_hash,state,created_at,updated_at) "
-                "VALUES (?,?,?,'reserved',?,?)",
-                (job_id, key, text_hash, now, now),
+                "INSERT INTO jobs "
+                "(job_id,request_key,text_hash,state,created_at,updated_at,protocol,wire_hash) "
+                "VALUES (?,?,?,'reserved',?,?,?,?)",
+                (job_id, key, text_hash, now, now, protocol, wire_hash or text_hash),
             )
             return self.get(job_id), True
 
@@ -162,9 +246,16 @@ class Journal:
 
     def prune(self, ttl: float):
         with self._mutex, self.db:
+            # Keep old request identities as tombstones; expiry must not re-post them with a header.
             self.db.execute(
-                "DELETE FROM jobs WHERE state IN ('completed','failed','cleared') AND updated_at<?",
-                (time.time() - ttl,),
+                "UPDATE jobs SET state='cleared',response=NULL,error_code='legacy_cache_expired' "
+                "WHERE protocol=? AND state='completed' AND updated_at<?",
+                (LEGACY_PROTOCOL, time.time() - ttl),
+            )
+            self.db.execute(
+                "DELETE FROM jobs WHERE protocol=? "
+                "AND state IN ('completed','failed','cleared') AND updated_at<?",
+                (INVISIBLE_PROTOCOL, time.time() - ttl),
             )
 
     def close(self):
@@ -179,10 +270,13 @@ def pending_summary(directory: Path) -> list[dict]:
     db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         db.row_factory = sqlite3.Row
+        columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+        protocol_column = "protocol" if "protocol" in columns else "'raw-v0' AS protocol"
         return [
             dict(row)
             for row in db.execute(
-                "SELECT job_id,state,created_at,updated_at,baseline,error_code FROM jobs "
+                f"SELECT job_id,state,created_at,updated_at,baseline,error_code,{protocol_column} "
+                "FROM jobs "
                 "WHERE state IN ('reserved','prepared','sending','waiting','uncertain')"
             )
         ]

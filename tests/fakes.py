@@ -6,10 +6,13 @@ from contextlib import contextmanager
 
 from muse_airi_bridge.config import Settings
 from muse_airi_bridge.errors import BridgeError
+from muse_airi_bridge.protocol import emotion_footer
 from muse_airi_bridge.requests import CHAT_FORMAT_PREFIX, MODEL
 
+REPLY_WIRE = "回答です😊" + emotion_footer("happy")
 
-def event(seq, name="message.assistant", text="回答です😊", **values):
+
+def event(seq, name="message.assistant", text=REPLY_WIRE, **values):
     return {
         "seq": seq,
         "event_name": name,
@@ -41,7 +44,7 @@ def conversation(text="  原文\n次の行  ", **kwargs):
 
 
 class FakeAdapter:
-    def __init__(self, *, auto_reply=True, failure=None):
+    def __init__(self, *, auto_reply=True, failure=None, reply_text=REPLY_WIRE):
         self.events = [event(10, text="古い回答")]
         self.sent = []
         self.opens = 0
@@ -50,6 +53,7 @@ class FakeAdapter:
         self.release = threading.Event()
         self.posted = threading.Event()
         self.failure = failure
+        self.reply_text = reply_text
         self.mutex = threading.RLock()
         self.receivers = []
 
@@ -78,7 +82,9 @@ class FakeAdapter:
                         raise BridgeError(503, "muse_unavailable", "History unavailable.")
                     if adapter.sent and (adapter.auto_reply or adapter.release.is_set()):
                         if adapter.events[-1]["event_name"] == "message.user":
-                            adapter.events.append(event(adapter.events[-1]["seq"] + 1))
+                            adapter.events.append(
+                                event(adapter.events[-1]["seq"] + 1, text=adapter.reply_text)
+                            )
                     return copy.deepcopy(adapter.events)
 
             def send(self, text):

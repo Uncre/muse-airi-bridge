@@ -5,10 +5,11 @@ import pytest
 from muse_airi_bridge.errors import BridgeError
 from muse_airi_bridge.journal import pending_summary
 from muse_airi_bridge.muse import text_hash
+from muse_airi_bridge.protocol import INVISIBLE_PROTOCOL, outbound_text
 from muse_airi_bridge.requests import ChatRequest, route
 from muse_airi_bridge.worker import BridgeWorker, select_reply
 
-from .fakes import FakeAdapter, conversation, event, settings
+from .fakes import REPLY_WIRE, FakeAdapter, conversation, event, settings
 
 
 def routed(text="original"):
@@ -22,8 +23,11 @@ def test_completed_reply_and_cached_replay_use_one_post(tmp_path):
         result = worker.submit(routed()).result(2)
         replay = worker.submit(routed()).result(2)
         assert result == replay
-        assert result.response == "回答です😊"
-        assert adapter.sent == ["original"]
+        assert result.response == REPLY_WIRE
+        assert result.text_hash == text_hash("original")
+        assert result.wire_hash == text_hash(outbound_text("original"))
+        assert result.protocol == INVISIBLE_PROTOCOL
+        assert adapter.sent == [outbound_text("original")]
         assert len(set(adapter.receivers)) == 1
     finally:
         worker.close()
@@ -43,7 +47,7 @@ def test_concurrent_identical_requests_share_one_job_and_other_turn_is_busy(tmp_
         assert error.value.code == "muse_busy"
         adapter.release.set()
         assert futures[0].result(2).state == "completed"
-        assert adapter.sent == ["original"]
+        assert adapter.sent == [outbound_text("original")]
     finally:
         worker.close()
 
@@ -57,7 +61,7 @@ def test_baseline_failure_posts_nothing_and_is_safe_to_retry(tmp_path):
         assert adapter.sent == []
         adapter.failure = None
         assert worker.submit(routed()).result(2).state == "completed"
-        assert adapter.sent == ["original"]
+        assert adapter.sent == [outbound_text("original")]
     finally:
         worker.close()
 
@@ -79,8 +83,8 @@ def test_unknown_send_failure_is_redacted_and_never_reposted_after_restart(tmp_p
         adapter.failure = None
         result = second.reconcile(job_id)
         assert result.state == "completed"
-        assert second.submit(routed()).result(2).response == "回答です😊"
-        assert adapter.sent == ["original"]
+        assert second.submit(routed()).result(2).response == REPLY_WIRE
+        assert adapter.sent == [outbound_text("original")]
     finally:
         second.close()
 
@@ -121,7 +125,13 @@ def test_second_process_cannot_take_over_a_live_state_directory(tmp_path):
 def test_interrupted_send_is_not_treated_as_safe_to_send_again(tmp_path):
     config = settings(tmp_path)
     worker = BridgeWorker(config, FakeAdapter())
-    job, _ = worker.journal.reserve(routed().fingerprint, text_hash("original"), 600)
+    job, _ = worker.journal.reserve(
+        routed().fingerprint,
+        text_hash("original"),
+        600,
+        protocol=INVISIBLE_PROTOCOL,
+        wire_hash=text_hash(outbound_text("original")),
+    )
     worker.journal.update(job.job_id, "sending", baseline=10)
     worker.close()
     after_restart = BridgeWorker(config, FakeAdapter())
@@ -188,3 +198,40 @@ def test_other_owner_input_and_failed_reply_are_not_returned_as_success():
             text_hash("original"),
         )
     assert failed.value.code == "muse_reply_failed"
+
+
+def test_header_matching_and_reply_collection_use_content_not_display_text(tmp_path):
+    from contextlib import contextmanager
+
+    class DifferentDisplayAdapter(FakeAdapter):
+        @contextmanager
+        def open(self):
+            with super().open() as session:
+                read = session.history
+
+                def history():
+                    records = read()
+                    for item in records:
+                        item["payload"]["display_text"] = "different UI representation"
+                        item["display_text"] = "different top-level representation"
+                    return records
+
+                session.history = history
+                yield session
+
+    adapter = DifferentDisplayAdapter()
+    worker = BridgeWorker(settings(tmp_path), adapter)
+    try:
+        result = worker.submit(routed("  original\n")).result(2)
+        assert result.response == REPLY_WIRE
+        assert adapter.sent == [outbound_text("  original\n")]
+    finally:
+        worker.close()
+
+
+def test_new_protocol_never_guesses_from_display_text_if_content_is_missing():
+    owner = event(11, "message.user", outbound_text("original"))
+    del owner["payload"]["content"]
+    with pytest.raises(BridgeError) as error:
+        select_reply([owner, event(12)], 10, text_hash(outbound_text("original")))
+    assert error.value.code == "muse_content_missing"
